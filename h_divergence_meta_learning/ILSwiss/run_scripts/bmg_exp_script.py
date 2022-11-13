@@ -16,7 +16,7 @@ from rlkit.core.logger import load_from_file
 from rlkit.launchers.launcher_util import setup_logger, set_seed
 from rlkit.torch.common.networks import FlattenMlp
 from rlkit.torch.common.policies import ReparamTanhMultivariateGaussianPolicy
-from rlkit.torch.algorithms.sac.sac import SoftActorCritic
+from rlkit.torch.algorithms.bmg.bmg import BootstrappedMetaGradient
 from rlkit.torch.algorithms.torch_meta_rl_algorithm import TorchMetaRLAlgorithm
 
 
@@ -56,6 +56,8 @@ def experiment(variant):
 
     net_size = variant["net_size"]
     num_hidden = variant["num_hidden_layers"]
+    inner_loop_steps = variant["inner_loop_steps"]
+    outer_loop_steps = variant["outer_loop_steps"]
     qf1 = FlattenMlp(
         hidden_sizes=num_hidden * [net_size],
         input_size=obs_dim + action_dim,
@@ -77,14 +79,16 @@ def experiment(variant):
         action_dim=action_dim,
     )
 
-    trainer = SoftActorCritic(
-        policy=policy, qf1=qf1, qf2=qf2, vf=vf, **variant["sac_params"]
+    trainer = BootstrappedMetaGradient(
+        policy=policy, qf1=qf1, qf2=qf2, vf=vf, inner_loop_steps=inner_loop_steps, outer_loop_steps=outer_loop_steps, **variant["sac_params"]
     )
     algorithm = TorchMetaRLAlgorithm(
         trainer=trainer,
         env=env,
         training_env=training_env,
         exploration_policy=policy,
+        inner_loop_steps=inner_loop_steps,
+        outer_loop_steps=outer_loop_steps,
         **variant["rl_alg_params"]
     )
 

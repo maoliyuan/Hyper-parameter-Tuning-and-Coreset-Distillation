@@ -5,6 +5,7 @@ import torch
 from torch import nn as nn
 import torch.optim as optim
 import TorchOpt
+import copy
 from torch.distributions import Categorical
 from torch.distributions.kl import kl_divergence
 import rlkit.torch.utils.pytorch_util as ptu
@@ -39,6 +40,8 @@ class BootstrappedMetaGradient(Trainer):
         soft_target_tau=1e-2,
         policy_mean_reg_weight=1e-3,
         policy_std_reg_weight=1e-3,
+        inner_loop_steps=1, 
+        bootstrap_loop_steps=1,
         optimizer_class=optim.Adam,
         meta_optimizer_class=TorchOpt.MetaAdam,
         beta_1=0.9,
@@ -54,6 +57,12 @@ class BootstrappedMetaGradient(Trainer):
         self.soft_target_tau = soft_target_tau
         self.policy_mean_reg_weight = policy_mean_reg_weight
         self.policy_std_reg_weight = policy_std_reg_weight
+        self.inner_loop_steps = inner_loop_steps
+        self.bootstrap_loop_steps = bootstrap_loop_steps
+        self.num_steps_per_loop = inner_loop_steps + bootstrap_loop_steps
+        self.meta_observations = np.zeros((self.num_steps_per_loop, self.batch_size, self.replay_buffer._observation_dim))
+        self.k_state_dict = None
+        self.k_l_m1_state_dict = None
 
         self.target_vf = vf.copy()
         self.eval_statistics = None
@@ -86,7 +95,8 @@ class BootstrappedMetaGradient(Trainer):
         obs = batch["observations"]
         actions = batch["actions"]
         next_obs = batch["next_observations"]
-
+        self.meta_observations[n_train_step_total % self.num_steps_per_loop] = obs
+        policy_outputs = self.policy(obs, return_log_prob=True)
         """
         QF Loss
         """
@@ -97,55 +107,63 @@ class BootstrappedMetaGradient(Trainer):
         #     p.requires_grad = False
         # for p in self.policy.parameters():
         #     p.requires_grad = False
-        self.qf1_optimizer.zero_grad()
-        self.qf2_optimizer.zero_grad()
-        q1_pred = self.qf1(obs, actions)
-        q2_pred = self.qf2(obs, actions)
-        target_v_values = self.target_vf(
-            next_obs
-        )  # do not need grad || it's the shared part of two calculation
-        q_target = (
-            rewards + (1.0 - terminals) * self.discount * target_v_values
-        )  ## original implementation has detach
-        q_target = q_target.detach()
-        qf1_loss = 0.5 * torch.mean((q1_pred - q_target) ** 2)
-        qf2_loss = 0.5 * torch.mean((q2_pred - q_target) ** 2)
+        if n_train_step_total % self.num_steps_per_loop != self.num_steps_per_loop-1:
+            q1_pred = self.qf1(obs, actions)
+            q2_pred = self.qf2(obs, actions)
+            target_v_values = self.target_vf(
+                next_obs
+            )  # do not need grad || it's the shared part of two calculation
+            q_target = (
+                rewards + (1.0 - terminals) * self.discount * target_v_values
+            )  ## original implementation has detach
+            q_target = q_target.detach()
+            qf1_loss = 0.5 * torch.mean((q1_pred - q_target) ** 2)
+            qf2_loss = 0.5 * torch.mean((q2_pred - q_target) ** 2)
 
-        # freeze parameter of Q
-        # for p in itertools.chain(self.qf1.parameters(), self.qf2.parameters()):
-        #     p.requires_grad = False
+            # freeze parameter of Q
+            # for p in itertools.chain(self.qf1.parameters(), self.qf2.parameters()):
+            #     p.requires_grad = False
+            """
+            VF Loss
+            """
+            # Only unfreeze parameter of V
+            # for p in itertools.chain(self.qf1.parameters(), self.qf2.parameters()):
+            #     p.requires_grad = False
+            # for p in self.vf.parameters():
+            #     p.requires_grad = True
+            # for p in self.policy.parameters():
+            #     p.requires_grad = True  ##
+            v_pred = self.vf(obs)
+            # Make sure policy accounts for squashing functions like tanh correctly!
+            # in this part, we only need new_actions and log_pi with no grad
+            new_actions, policy_mean, policy_log_std, log_pi = policy_outputs[:4]
+            q1_new_acts = self.qf1(obs, new_actions)
+            q2_new_acts = self.qf2(obs, new_actions)  ## error
+            q_new_actions = torch.min(q1_new_acts, q2_new_acts)
+            v_target = q_new_actions - self.alpha * log_pi
+            v_target = v_target.detach()
+            vf_loss = 0.5 * torch.mean((v_pred - v_target) ** 2)
 
-        """
-        VF Loss
-        """
-        # Only unfreeze parameter of V
-        # for p in itertools.chain(self.qf1.parameters(), self.qf2.parameters()):
-        #     p.requires_grad = False
-        # for p in self.vf.parameters():
-        #     p.requires_grad = True
-        # for p in self.policy.parameters():
-        #     p.requires_grad = True  ##
-        self.vf_optimizer.zero_grad()
-        v_pred = self.vf(obs)
-        # Make sure policy accounts for squashing functions like tanh correctly!
-        policy_outputs = self.policy(obs, return_log_prob=True)
-        # in this part, we only need new_actions and log_pi with no grad
-        new_actions, policy_mean, policy_log_std, log_pi = policy_outputs[:4]
-        q1_new_acts = self.qf1(obs, new_actions)
-        q2_new_acts = self.qf2(obs, new_actions)  ## error
-        q_new_actions = torch.min(q1_new_acts, q2_new_acts)
-        v_target = q_new_actions - self.alpha * log_pi
-        v_target = v_target.detach()
-        vf_loss = 0.5 * torch.mean((v_pred - v_target) ** 2)
+            self.qf1_optimizer.step(qf1_loss)
+            self.qf2_optimizer.step(qf2_loss)
 
-        qf1_loss.backward()
-        qf2_loss.backward()
-        vf_loss.backward()
+            self.vf_optimizer.step(vf_loss)
+            """
+            Update networks
+            """
+            # unfreeze all -> initial states
+            # for p in itertools.chain(self.qf1.parameters(), self.qf2.parameters()):
+            #     p.requires_grad = True
+            # for p in self.vf.parameters():
+            #     p.requires_grad = True
+            # for p in self.policy.parameters():
+            #     p.requires_grad = True
 
-        self.qf1_optimizer.step()
-        self.qf2_optimizer.step()
+            # unfreeze parameter of Q
+            # for p in itertools.chain(self.qf1.parameters(), self.qf2.parameters()):
+            #     p.requires_grad = True
 
-        self.vf_optimizer.step()
+            self._update_target_network()
 
         """
         Policy Loss
@@ -156,37 +174,38 @@ class BootstrappedMetaGradient(Trainer):
         #     p.requires_grad = False
         # for p in self.policy.parameters():
         #     p.requires_grad = True
+        qf1_copy = copy.deepcopy(self.qf1)
+        qf2_copy = copy.deepcopy(self.qf2)
         new_actions, policy_mean, policy_log_std, log_pi = policy_outputs[:4]
-        q1_new_acts = self.qf1(obs, new_actions)
-        q2_new_acts = self.qf2(obs, new_actions)  ## error
+        q1_new_acts = qf1_copy(obs, new_actions)
+        q2_new_acts = qf2_copy(obs, new_actions)  ## error
         q_new_actions = torch.min(q1_new_acts, q2_new_acts)
 
-        self.policy_optimizer.zero_grad()
-        policy_loss = torch.mean(self.alpha * log_pi - q_new_actions)  ##
+        if n_train_step_total % self.num_steps_per_loop != self.num_steps_per_loop-1:
+            policy_loss = torch.mean(self.alpha * log_pi - q_new_actions)
+        else:
+            policy_loss = torch.mean(-1 * q_new_actions)  ##
         mean_reg_loss = self.policy_mean_reg_weight * (policy_mean**2).mean()
         std_reg_loss = self.policy_std_reg_weight * (policy_log_std**2).mean()
         policy_reg_loss = mean_reg_loss + std_reg_loss
         policy_loss = policy_loss + policy_reg_loss
-        policy_loss.backward()
         self.policy_optimizer.step()
 
-        """
-        Update networks
-        """
-        # unfreeze all -> initial states
-        # for p in itertools.chain(self.qf1.parameters(), self.qf2.parameters()):
-        #     p.requires_grad = True
-        # for p in self.vf.parameters():
-        #     p.requires_grad = True
-        # for p in self.policy.parameters():
-        #     p.requires_grad = True
+        if n_train_step_total % self.num_steps_per_loop == self.inner_loop_steps-1:
+            assert self.k_state_dict == None
+            self.k_state_dict = TorchOpt.extract_state_dict(self.policy)
+        if n_train_step_total % self.num_steps_per_loop == self.num_steps_per_loop-2:
+            assert self.k_l_m1_state_dict == None
+            self.k_l_m1_state_dict = TorchOpt.extract_state_dict(self.policy)
+        if n_train_step_total % self.num_steps_per_loop == self.num_steps_per_loop-1:
+            calculate KL_divergence
+            backward
+            step forward
+            recover k+l-1
+            zero meta grad
 
-        # unfreeze parameter of Q
-        # for p in itertools.chain(self.qf1.parameters(), self.qf2.parameters()):
-        #     p.requires_grad = True
-
-        self._update_target_network()
-
+            self.k_state_dict = None
+            self.k_l_m1_state_dict = None
         """
         Save some statistics for eval
         """
@@ -250,6 +269,18 @@ class BootstrappedMetaGradient(Trainer):
 
     def _update_target_network(self):
         ptu.soft_update_from_to(self.vf, self.target_vf, self.soft_target_tau)
+
+    def kl_matching_function(self, ac_k, tb, states, ac_k_state_dict):
+        with torch.no_grad():
+            dist_tb = [tb(states[i])[0] for i in range(len(states))]
+
+        TorchOpt.recover_state_dict(ac_k, ac_k_state_dict)
+        dist_k = [ac_k(states[i])[0] for i in range(len(states))]
+        
+        # KL Div between dsitributions of TB and AC_K, respectively
+        kl_div = sum([kl_divergence(dist_tb[i], dist_k[i]) for i in range(len(states))])
+
+        return kl_div
 
     def get_snapshot(self):
         return dict(

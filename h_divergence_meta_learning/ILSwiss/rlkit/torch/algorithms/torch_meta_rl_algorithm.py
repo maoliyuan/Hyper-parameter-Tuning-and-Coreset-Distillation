@@ -15,7 +15,6 @@ class TorchMetaRLAlgorithm(TorchBaseAlgorithm):
         self.inner_train_steps_total = 0
         self.inner_loop_steps = inner_loop_steps
         self.bootstrap_loop_steps = bootstrap_loop_steps
-        self.meta_observations = np.zeros((inner_loop_steps + bootstrap_loop_steps, self.replay_buffer._observation_dim))
 
     def get_batch(self):
         batch = self.replay_buffer.random_batch(self.batch_size)
@@ -31,7 +30,7 @@ class TorchMetaRLAlgorithm(TorchBaseAlgorithm):
 
     def _do_training(self, epoch):
         for step in range(self.num_train_steps_per_train_call):
-            self.inner_train_steps_total = 1 + step + self._n_train_steps_total*self.num_train_steps_per_train_call
+            self.inner_train_steps_total = step + self._n_train_steps_total*self.num_train_steps_per_train_call
             if getattr(self.trainer, "on_policy", False):
                 self.trainer.train_step(self.get_all_trajs(), self.inner_train_steps_total)
                 self.clear_buffer()
