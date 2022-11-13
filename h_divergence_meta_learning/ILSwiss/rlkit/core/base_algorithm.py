@@ -51,6 +51,7 @@ class BaseAlgorithm(metaclass=abc.ABCMeta):
         freq_log_visuals=1,
         eval_deterministic=False,
         eval_preprocess_func=None,
+        inference_reward_num=None,
     ):
         self.env = env
         self.env_num = 1
@@ -60,6 +61,9 @@ class BaseAlgorithm(metaclass=abc.ABCMeta):
             pass
         self.training_env = training_env
         self.exploration_policy = exploration_policy
+        if inference_reward_num != None:
+            self.inference_reward_num = inference_reward_num
+            self.reward_list_one_iter = []
 
         self.num_epochs = num_epochs + 1 # make the last epoch `num_epochs`
         self.num_env_steps_per_epoch = num_steps_per_epoch
@@ -199,6 +203,7 @@ class BaseAlgorithm(metaclass=abc.ABCMeta):
 
                 rewards = raw_rewards
                 total_rews += raw_rewards
+                self.reward_list_one_iter.append(raw_rewards)
 
                 self._handle_vec_step(
                     observations,

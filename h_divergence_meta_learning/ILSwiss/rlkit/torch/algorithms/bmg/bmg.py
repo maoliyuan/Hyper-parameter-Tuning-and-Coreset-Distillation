@@ -26,13 +26,13 @@ class BootstrappedMetaGradient(Trainer):
     def __init__(
         self,
         policy: nn.Module,
+        policy_k: nn.Module,
         qf1: nn.Module,
         qf2: nn.Module,
         vf: nn.Module,
         meta_mlp: nn.Module,
         reward_scale=1.0,
         discount=0.99,
-        alpha=1.0,
         policy_lr=1e-3,
         qf_lr=1e-3,
         vf_lr=1e-3,
@@ -44,10 +44,14 @@ class BootstrappedMetaGradient(Trainer):
         bootstrap_loop_steps=1,
         optimizer_class=optim.Adam,
         meta_optimizer_class=TorchOpt.MetaAdam,
+        matching_loss="mse",
+        matching_mean_coef=1,
+        matching_std_coef=1,
         beta_1=0.9,
         **kwargs,
     ):
         self.policy = policy
+        self.policy_k = policy_k
         self.qf1 = qf1
         self.qf2 = qf2
         self.vf = vf
@@ -60,9 +64,13 @@ class BootstrappedMetaGradient(Trainer):
         self.inner_loop_steps = inner_loop_steps
         self.bootstrap_loop_steps = bootstrap_loop_steps
         self.num_steps_per_loop = inner_loop_steps + bootstrap_loop_steps
-        self.meta_observations = np.zeros((self.num_steps_per_loop, self.batch_size, self.replay_buffer._observation_dim))
+        self.meta_observations = None
         self.k_state_dict = None
         self.k_l_m1_state_dict = None
+        self.matching_mean_coef = matching_mean_coef
+        self.matching_std_coef = matching_std_coef
+        if matching_loss == "mse":
+            self.matching_loss = nn.MSELoss()
 
         self.target_vf = vf.copy()
         self.eval_statistics = None
@@ -83,9 +91,7 @@ class BootstrappedMetaGradient(Trainer):
             self.meta_mlp.parameters(), lr=meta_mlp_lr, betas=(beta_1, 0.999)
         )
 
-        self.alpha = alpha
-
-    def train_step(self, batch, n_train_step_total):
+    def train_step(self, batch, n_train_step_total, avg_reward_per_iter):
         # q_params = itertools.chain(self.qf1.parameters(), self.qf2.parameters())
         # v_params = itertools.chain(self.vf.parameters())
         # policy_params = itertools.chain(self.policy.parameters())
@@ -140,7 +146,7 @@ class BootstrappedMetaGradient(Trainer):
             q1_new_acts = self.qf1(obs, new_actions)
             q2_new_acts = self.qf2(obs, new_actions)  ## error
             q_new_actions = torch.min(q1_new_acts, q2_new_acts)
-            v_target = q_new_actions - self.alpha * log_pi
+            v_target = q_new_actions - self.meta_mlp(avg_reward_per_iter) * log_pi
             v_target = v_target.detach()
             vf_loss = 0.5 * torch.mean((v_pred - v_target) ** 2)
 
@@ -182,7 +188,7 @@ class BootstrappedMetaGradient(Trainer):
         q_new_actions = torch.min(q1_new_acts, q2_new_acts)
 
         if n_train_step_total % self.num_steps_per_loop != self.num_steps_per_loop-1:
-            policy_loss = torch.mean(self.alpha * log_pi - q_new_actions)
+            policy_loss = torch.mean(self.meta_mlp(avg_reward_per_iter) * log_pi - q_new_actions)
         else:
             policy_loss = torch.mean(-1 * q_new_actions)  ##
         mean_reg_loss = self.policy_mean_reg_weight * (policy_mean**2).mean()
@@ -198,12 +204,19 @@ class BootstrappedMetaGradient(Trainer):
             assert self.k_l_m1_state_dict == None
             self.k_l_m1_state_dict = TorchOpt.extract_state_dict(self.policy)
         if n_train_step_total % self.num_steps_per_loop == self.num_steps_per_loop-1:
-            calculate KL_divergence
-            backward
-            step forward
-            recover k+l-1
-            zero meta grad
-
+            matching_loss = self.matching_function(self.policy_k, self.policy, self.meta_observations, self.k_state_dict)
+            self.meta_mlp_optimizer.zero_grad()
+            matching_loss.backward()
+            self.meta_mlp_optimizer.step()
+            TorchOpt.recover_state_dict(self.policy, self.k_l_m1_state_dict)
+            TorchOpt.stop_gradient(self.policy)
+            TorchOpt.stop_gradient(self.policy_optimizer)
+            TorchOpt.stop_gradient(self.qf1)
+            TorchOpt.stop_gradient(self.qf1_optimizer)
+            TorchOpt.stop_gradient(self.qf2)
+            TorchOpt.stop_gradient(self.qf2_optimizer)
+            TorchOpt.stop_gradient(self.vf)
+            TorchOpt.stop_gradient(self.vf_optimizer)
             self.k_state_dict = None
             self.k_l_m1_state_dict = None
         """
@@ -270,17 +283,20 @@ class BootstrappedMetaGradient(Trainer):
     def _update_target_network(self):
         ptu.soft_update_from_to(self.vf, self.target_vf, self.soft_target_tau)
 
-    def kl_matching_function(self, ac_k, tb, states, ac_k_state_dict):
+    def matching_function(self, policy_k, tb, meta_observations, policy_k_state_dict):
+        meta_observations = torch.reshape(meta_observations, (-1, meta_observations.shape[-1]))
         with torch.no_grad():
-            dist_tb = [tb(states[i])[0] for i in range(len(states))]
-
-        TorchOpt.recover_state_dict(ac_k, ac_k_state_dict)
-        dist_k = [ac_k(states[i])[0] for i in range(len(states))]
+            policy_outputs_tb = tb(meta_observations)
+            policy_mean_tb, policy_log_std_tb = policy_outputs_tb[1], policy_outputs_tb[2]
         
-        # KL Div between dsitributions of TB and AC_K, respectively
-        kl_div = sum([kl_divergence(dist_tb[i], dist_k[i]) for i in range(len(states))])
+        TorchOpt.recover_state_dict(policy_k, policy_k_state_dict)
+        policy_outputs_k = policy_k(meta_observations)
+        policy_mean_k, policy_log_std_k = policy_outputs_k[1], policy_outputs_k[2]
+        
+        # Div between dsitributions of TB and AC_K, respectively
+        div = self.matching_mean_coef * self.matching_loss(policy_mean_tb, policy_mean_k) + self.matching_std_coef * self.matching_loss(policy_log_std_tb, policy_log_std_k)
 
-        return kl_div
+        return div
 
     def get_snapshot(self):
         return dict(

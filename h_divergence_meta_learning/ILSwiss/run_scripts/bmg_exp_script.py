@@ -8,13 +8,14 @@ sys.path.insert(0, parentdir)
 print(sys.path)
 
 import gym
+import torch
 from rlkit.envs import get_env, get_envs
 from rlkit.envs.wrappers import NormalizedBoxEnv, ProxyEnv
 
 import rlkit.torch.utils.pytorch_util as ptu
 from rlkit.core.logger import load_from_file
 from rlkit.launchers.launcher_util import setup_logger, set_seed
-from rlkit.torch.common.networks import FlattenMlp
+from rlkit.torch.common.networks import FlattenMlp, Mlp
 from rlkit.torch.common.policies import ReparamTanhMultivariateGaussianPolicy
 from rlkit.torch.algorithms.bmg.bmg import BootstrappedMetaGradient
 from rlkit.torch.algorithms.torch_meta_rl_algorithm import TorchMetaRLAlgorithm
@@ -55,9 +56,14 @@ def experiment(variant):
     action_dim = act_space.shape[0]
 
     net_size = variant["net_size"]
+    meta_net_size = variant["meta_net_size"]
+    inference_reward_num = variant["inference_reward_num"]
     num_hidden = variant["num_hidden_layers"]
     inner_loop_steps = variant["inner_loop_steps"]
     outer_loop_steps = variant["outer_loop_steps"]
+    matching_loss = variant["matching_loss"]
+    matching_mean_coef = variant["matching_mean_coef"]
+    matching_std_coef = variant["matching_std_coef"]
     qf1 = FlattenMlp(
         hidden_sizes=num_hidden * [net_size],
         input_size=obs_dim + action_dim,
@@ -73,14 +79,25 @@ def experiment(variant):
         input_size=obs_dim,
         output_size=1,
     )
+    meta_mlp = Mlp(
+        hidden_sizes=num_hidden * [meta_net_size],
+        input_size=inference_reward_num + 1,
+        output_size=1,
+    )
     policy = ReparamTanhMultivariateGaussianPolicy(
         hidden_sizes=num_hidden * [net_size],
         obs_dim=obs_dim,
         action_dim=action_dim,
     )
-
+    policy_k = ReparamTanhMultivariateGaussianPolicy(
+        hidden_sizes=num_hidden * [net_size],
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+    )
     trainer = BootstrappedMetaGradient(
-        policy=policy, qf1=qf1, qf2=qf2, vf=vf, inner_loop_steps=inner_loop_steps, outer_loop_steps=outer_loop_steps, **variant["sac_params"]
+        policy=policy, policy_k=policy_k, meta_mlp=meta_mlp,
+        qf1=qf1, qf2=qf2, vf=vf, inner_loop_steps=inner_loop_steps, outer_loop_steps=outer_loop_steps, 
+        matching_mean_coef=matching_mean_coef, matching_std_coef=matching_std_coef, matching_loss=matching_loss, **variant["sac_params"]
     )
     algorithm = TorchMetaRLAlgorithm(
         trainer=trainer,
@@ -89,8 +106,11 @@ def experiment(variant):
         exploration_policy=policy,
         inner_loop_steps=inner_loop_steps,
         outer_loop_steps=outer_loop_steps,
+        inference_reward_num=inference_reward_num,
+        device=ptu.device,
         **variant["rl_alg_params"]
     )
+    trainer.meta_observations = torch.zeros((trainer.num_steps_per_loop, algorithm.batch_size, algorithm.replay_buffer._observation_dim))
 
     epoch = 0
     if "load_params" in variant:
