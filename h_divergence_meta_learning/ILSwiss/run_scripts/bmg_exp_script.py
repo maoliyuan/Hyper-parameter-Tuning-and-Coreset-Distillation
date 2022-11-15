@@ -60,7 +60,7 @@ def experiment(variant):
     inference_reward_num = variant["inference_reward_num"]
     num_hidden = variant["num_hidden_layers"]
     inner_loop_steps = variant["inner_loop_steps"]
-    outer_loop_steps = variant["outer_loop_steps"]
+    bootstrap_loop_steps = variant["bootstrap_loop_steps"]
     matching_loss = variant["matching_loss"]
     matching_mean_coef = variant["matching_mean_coef"]
     matching_std_coef = variant["matching_std_coef"]
@@ -96,7 +96,7 @@ def experiment(variant):
     )
     trainer = BootstrappedMetaGradient(
         policy=policy, policy_k=policy_k, meta_mlp=meta_mlp,
-        qf1=qf1, qf2=qf2, vf=vf, inner_loop_steps=inner_loop_steps, outer_loop_steps=outer_loop_steps, 
+        qf1=qf1, qf2=qf2, vf=vf, inner_loop_steps=inner_loop_steps, bootstrap_loop_steps=bootstrap_loop_steps, 
         matching_mean_coef=matching_mean_coef, matching_std_coef=matching_std_coef, matching_loss=matching_loss, **variant["sac_params"]
     )
     algorithm = TorchMetaRLAlgorithm(
@@ -105,7 +105,7 @@ def experiment(variant):
         training_env=training_env,
         exploration_policy=policy,
         inner_loop_steps=inner_loop_steps,
-        outer_loop_steps=outer_loop_steps,
+        bootstrap_loop_steps=bootstrap_loop_steps,
         inference_reward_num=inference_reward_num,
         device=ptu.device,
         **variant["rl_alg_params"]

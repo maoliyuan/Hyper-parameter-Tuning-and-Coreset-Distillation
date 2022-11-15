@@ -1,4 +1,5 @@
 import abc
+import torch
 import numpy as np
 
 from rlkit.core.base_algorithm import BaseAlgorithm

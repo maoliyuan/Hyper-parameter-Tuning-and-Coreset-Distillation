@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torch import nn as nn
 import torch.optim as optim
-import TorchOpt
+import torchopt as TorchOpt
 import copy
 from torch.distributions import Categorical
 from torch.distributions.kl import kl_divergence
