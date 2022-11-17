@@ -344,7 +344,6 @@ class ReparamTanhMultivariateGaussianPolicy(Mlp, ExplorationPolicy):
             return log_prob, mean, log_std
         return log_prob
 
-
 class ReparamMultivariateGaussianPolicy(Mlp, ExplorationPolicy):
     def __init__(
         self,

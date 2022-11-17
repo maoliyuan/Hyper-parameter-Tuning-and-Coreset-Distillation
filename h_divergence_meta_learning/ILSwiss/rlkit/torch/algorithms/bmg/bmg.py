@@ -25,6 +25,7 @@ class BootstrappedMetaGradient(Trainer):
 
     def __init__(
         self,
+        device,
         policy: nn.Module,
         policy_k: nn.Module,
         qf1: nn.Module,
@@ -43,13 +44,14 @@ class BootstrappedMetaGradient(Trainer):
         inner_loop_steps=1, 
         bootstrap_loop_steps=1,
         optimizer_class=optim.Adam,
-        meta_optimizer_class=TorchOpt.MetaAdam,
+        meta_optimizer_class=TorchOpt.MetaSGD,
         matching_loss="mse",
         matching_mean_coef=1,
         matching_std_coef=1,
         beta_1=0.9,
         **kwargs,
     ):
+        self.device=device
         self.policy = policy
         self.policy_k = policy_k
         self.qf1 = qf1
@@ -64,7 +66,6 @@ class BootstrappedMetaGradient(Trainer):
         self.inner_loop_steps = inner_loop_steps
         self.bootstrap_loop_steps = bootstrap_loop_steps
         self.num_steps_per_loop = inner_loop_steps + bootstrap_loop_steps
-        self.meta_observations = None
         self.k_state_dict = None
         self.k_l_m1_state_dict = None
         self.matching_mean_coef = matching_mean_coef
@@ -76,21 +77,21 @@ class BootstrappedMetaGradient(Trainer):
         self.eval_statistics = None
 
         self.policy_optimizer = meta_optimizer_class(
-            self.policy.parameters(), lr=policy_lr, betas=(beta_1, 0.999)
+            self.policy, lr=policy_lr
         )
         self.qf1_optimizer = meta_optimizer_class(
-            self.qf1.parameters(), lr=qf_lr, betas=(beta_1, 0.999)
+            self.qf1, lr=qf_lr
         )
         self.qf2_optimizer = meta_optimizer_class(
-            self.qf2.parameters(), lr=qf_lr, betas=(beta_1, 0.999)
+            self.qf2, lr=qf_lr
         )
         self.vf_optimizer = meta_optimizer_class(
-            self.vf.parameters(), lr=vf_lr, betas=(beta_1, 0.999)
+            self.vf, lr=vf_lr
         )
         self.meta_mlp_optimizer = optimizer_class(
             self.meta_mlp.parameters(), lr=meta_mlp_lr, betas=(beta_1, 0.999)
         )
-
+        
     def train_step(self, batch, n_train_step_total, avg_reward_per_iter):
         # q_params = itertools.chain(self.qf1.parameters(), self.qf2.parameters())
         # v_params = itertools.chain(self.vf.parameters())
@@ -101,7 +102,6 @@ class BootstrappedMetaGradient(Trainer):
         obs = batch["observations"]
         actions = batch["actions"]
         next_obs = batch["next_observations"]
-        self.meta_observations[n_train_step_total % self.num_steps_per_loop] = obs
         policy_outputs = self.policy(obs, return_log_prob=True)
         """
         QF Loss
@@ -180,11 +180,11 @@ class BootstrappedMetaGradient(Trainer):
         #     p.requires_grad = False
         # for p in self.policy.parameters():
         #     p.requires_grad = True
-        qf1_copy = copy.deepcopy(self.qf1)
-        qf2_copy = copy.deepcopy(self.qf2)
+        qf1_copy = copy.deepcopy(self.qf1).to(self.device)
+        qf2_copy = copy.deepcopy(self.qf2).to(self.device)
         new_actions, policy_mean, policy_log_std, log_pi = policy_outputs[:4]
-        q1_new_acts = qf1_copy(obs, new_actions)
-        q2_new_acts = qf2_copy(obs, new_actions)  ## error
+        q1_new_acts = qf1_copy(torch.cat((obs, actions), dim=1))
+        q2_new_acts = qf2_copy(torch.cat((obs, actions), dim=1))  ## error
         q_new_actions = torch.min(q1_new_acts, q2_new_acts)
 
         if n_train_step_total % self.num_steps_per_loop != self.num_steps_per_loop-1:
@@ -195,7 +195,7 @@ class BootstrappedMetaGradient(Trainer):
         std_reg_loss = self.policy_std_reg_weight * (policy_log_std**2).mean()
         policy_reg_loss = mean_reg_loss + std_reg_loss
         policy_loss = policy_loss + policy_reg_loss
-        self.policy_optimizer.step()
+        self.policy_optimizer.step(policy_loss)
 
         if n_train_step_total % self.num_steps_per_loop == self.inner_loop_steps-1:
             assert self.k_state_dict == None
@@ -204,9 +204,10 @@ class BootstrappedMetaGradient(Trainer):
             assert self.k_l_m1_state_dict == None
             self.k_l_m1_state_dict = TorchOpt.extract_state_dict(self.policy)
         if n_train_step_total % self.num_steps_per_loop == self.num_steps_per_loop-1:
-            matching_loss = self.matching_function(self.policy_k, self.policy, self.meta_observations, self.k_state_dict)
+            matching_loss = self.matching_function(self.policy_k, self.policy, obs, self.k_state_dict)
             self.meta_mlp_optimizer.zero_grad()
-            matching_loss.backward()
+            with torch.autograd.set_detect_anomaly(True):
+                matching_loss.backward()
             self.meta_mlp_optimizer.step()
             TorchOpt.recover_state_dict(self.policy, self.k_l_m1_state_dict)
             TorchOpt.stop_gradient(self.policy)
@@ -277,6 +278,7 @@ class BootstrappedMetaGradient(Trainer):
             self.qf1,
             self.qf2,
             self.vf,
+            self.meta_mlp,
             self.target_vf,
         ]
 
@@ -284,11 +286,10 @@ class BootstrappedMetaGradient(Trainer):
         ptu.soft_update_from_to(self.vf, self.target_vf, self.soft_target_tau)
 
     def matching_function(self, policy_k, tb, meta_observations, policy_k_state_dict):
-        meta_observations = torch.reshape(meta_observations, (-1, meta_observations.shape[-1]))
         with torch.no_grad():
             policy_outputs_tb = tb(meta_observations)
             policy_mean_tb, policy_log_std_tb = policy_outputs_tb[1], policy_outputs_tb[2]
-        
+
         TorchOpt.recover_state_dict(policy_k, policy_k_state_dict)
         policy_outputs_k = policy_k(meta_observations)
         policy_mean_k, policy_log_std_k = policy_outputs_k[1], policy_outputs_k[2]
@@ -298,6 +299,7 @@ class BootstrappedMetaGradient(Trainer):
 
         return div
 
+    # can't save optimizer because torchopt object can't be saved by pickle, can extract before saving
     def get_snapshot(self):
         return dict(
             qf1=self.qf1,
@@ -305,10 +307,10 @@ class BootstrappedMetaGradient(Trainer):
             policy=self.policy,
             vf=self.vf,
             target_vf=self.target_vf,
-            policy_optimizer=self.policy_optimizer,
-            qf1_optimizer=self.qf1_optimizer,
-            qf2_optimizer=self.qf2_optimizer,
-            vf_optimizer=self.vf_optimizer,
+            # policy_optimizer=self.policy_optimizer,
+            # qf1_optimizer=self.qf1_optimizer,
+            # qf2_optimizer=self.qf2_optimizer,
+            # vf_optimizer=self.vf_optimizer,
         )
 
     def load_snapshot(self, snapshot):
@@ -317,10 +319,10 @@ class BootstrappedMetaGradient(Trainer):
         self.policy = snapshot["policy"]
         self.vf = snapshot["vf"]
         self.target_vf = snapshot["target_vf"]
-        self.policy_optimizer = snapshot["policy_optimizer"]
-        self.qf1_optimizer = snapshot["qf1_optimizer"]
-        self.qf2_optimizer = snapshot["qf2_optimizer"]
-        self.vf_optimizer = snapshot["self.vf_optimizer"]
+        # self.policy_optimizer = snapshot["policy_optimizer"]
+        # self.qf1_optimizer = snapshot["qf1_optimizer"]
+        # self.qf2_optimizer = snapshot["qf2_optimizer"]
+        # self.vf_optimizer = snapshot["self.vf_optimizer"]
 
     def get_eval_statistics(self):
         return self.eval_statistics

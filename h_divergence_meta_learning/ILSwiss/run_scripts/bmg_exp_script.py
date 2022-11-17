@@ -1,5 +1,6 @@
 import yaml
 import argparse
+import torchopt
 import os, inspect, sys
 
 currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
@@ -95,7 +96,7 @@ def experiment(variant):
         action_dim=action_dim,
     )
     trainer = BootstrappedMetaGradient(
-        policy=policy, policy_k=policy_k, meta_mlp=meta_mlp,
+        device=ptu.device, policy=policy, policy_k=policy_k, meta_mlp=meta_mlp,
         qf1=qf1, qf2=qf2, vf=vf, inner_loop_steps=inner_loop_steps, bootstrap_loop_steps=bootstrap_loop_steps, 
         matching_mean_coef=matching_mean_coef, matching_std_coef=matching_std_coef, matching_loss=matching_loss, **variant["sac_params"]
     )
@@ -110,7 +111,6 @@ def experiment(variant):
         device=ptu.device,
         **variant["rl_alg_params"]
     )
-    trainer.meta_observations = torch.zeros((trainer.num_steps_per_loop, algorithm.batch_size, algorithm.replay_buffer._observation_dim))
 
     epoch = 0
     if "load_params" in variant:
@@ -118,7 +118,19 @@ def experiment(variant):
 
     if ptu.gpu_enabled():
         algorithm.to(ptu.device)
-
+    # meta_optimizer_class = torchopt.MetaAdam
+    # algorithm.policy_optimizer = meta_optimizer_class(
+    #     policy, lr=0.0001
+    # )
+    # algorithm.qf1_optimizer = meta_optimizer_class(
+    #     qf1, lr=0.0001
+    # )
+    # algorithm.qf2_optimizer = meta_optimizer_class(
+    #     qf2, lr=0.0001
+    # )
+    # algorithm.vf_optimizer = meta_optimizer_class(
+    #     vf, lr=0.0001
+    # )
     algorithm.train(start_epoch=epoch)
 
     return 1
