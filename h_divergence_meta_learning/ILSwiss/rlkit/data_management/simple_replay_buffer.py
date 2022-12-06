@@ -2,6 +2,7 @@ from itertools import starmap
 import numpy as np
 import pickle
 from rlkit.data_management.replay_buffer import ReplayBuffer
+import rlkit.data_management.craig as craig
 
 
 class SimpleReplayBuffer(ReplayBuffer):
@@ -85,6 +86,10 @@ class SimpleReplayBuffer(ReplayBuffer):
         timeout=False,
         **kwargs
     ):
+        if self._top + 1 >= self._max_replay_buffer_size:
+            # craig
+            self.compress_coreset(200)
+        
         self._actions[self._top] = action
         self._rewards[self._top] = reward
         self._terminals[self._top] = terminal
@@ -440,6 +445,76 @@ class SimpleReplayBuffer(ReplayBuffer):
         # assumption is trajectory lengths are AT MOST the length of the entire replay buffer
         self._cur_start = 0
         self._traj_endpoints = {}  # start->end means [start, end)
+        
+    def compress_coreset(self, comp_size=2000):
+        print(f"start compress. size: {self._top}")
+        
+        X = np.concatenate((self._actions[:self._top], self._rewards[:self._top]), axis=1)
+        if isinstance(self._observation_dim, tuple):
+            obs = self._observations.reshape(self._max_replay_buffer_size[:self._top], -1)
+            next_obs = self._next_obs.reshape(self._max_replay_buffer_size[:self._top], -1)
+            print(f'debug: obs shape after flatten: {obs.shape}')
+            X = np.concatenate((X, obs, next_obs), axis=1)
+        elif isinstance(self._observation_dim, dict):
+            obs_list = []
+            for key, dims in self._observation_dim.items():
+                obs_list.append(self._observations[key].reshape(self._max_replay_buffer_size[:self._top], -1))
+                obs_list.append(self._next_obs[key].reshape(self._max_replay_buffer_size[:self._top], -1))
+            obs_list = np.concatenate(obs_list, axis=1)
+            X = np.concatenate((X, obs_list), axis=1)
+        else:
+            X = np.concatenate((X, self._observations[:self._top], self._next_obs[:self._top]), axis=1)
+            
+            
+        order, _ = craig.coreset_order(X, 'euclidean', comp_size)
+        print(f"select order: {order[:10]}")
+        
+        
+        select_actions = self._actions[order]
+        select_rewards = self._rewards[order]
+        if isinstance(self._observation_dim, dict):
+            select_observations = {}
+            select_next_obs = {}
+            for key, dims in self._observation_dim.items():
+                select_observations[key] = self._observations[key][order]
+                select_next_obs = self._next_obs[key][order]
+        else:
+            select_observations = self._observations[order]
+            select_next_obs = self._next_obs[order]
+        
+        select_terminals = self._terminals[order]
+        select_timeouts = self._timeouts[order]
+        select_absorbing = self._absorbing[order]
+        select_trajs = self._trajs
+        select_cur_start = self._cur_start
+        select_traj_endpoints = self._traj_endpoints
+        
+        
+        self.clear()
+        
+        
+        if isinstance(self._observation_dim, dict):
+            for key, dims in self._observation_dim.items():
+                self._observations[key][:comp_size] = select_observations[key]
+                self._next_obs[key][:comp_size] = select_next_obs[key]
+        else:
+            self._observations[:comp_size] = select_observations
+            self._next_obs[:comp_size] = select_next_obs
+        self._actions[:comp_size] = select_actions
+
+        self._rewards[:comp_size] = select_rewards
+        self._terminals[:comp_size] = select_terminals
+        self._timeouts[:comp_size] = select_timeouts
+        self._absorbing[:comp_size] = select_absorbing
+        self._top = comp_size
+        self._size = comp_size
+        self._trajs = select_trajs
+
+        self._cur_start = select_cur_start
+        self._traj_endpoints = select_traj_endpoints
+        
+        print(f"compress success! size: {self._top}")
+        
 
 
 def concat_nested_dicts(d1, d2):
