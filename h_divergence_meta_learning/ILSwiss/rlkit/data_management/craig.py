@@ -99,7 +99,12 @@ def lazy_greedy_heap(F, V, B):
     return sset, vals
 
 
-def similarity(X, metric):
+def similarity(X, metric, rewards, reward_ratio=0):
+    assert(X.shape[0] == rewards.shape[0])
+    sigmoid = lambda x: 1 / (1 + np.exp(-x))
+    rewards[rewards < 0] = sigmoid(rewards[rewards < 0])
+    rewards[rewards >= 0] = rewards[rewards >= 0] + 0.5
+    rewards = rewards.repeat(X.shape[0], axis=1)
     dists = metrics.pairwise_distances(X, metric=metric, n_jobs=1)
     if metric == 'cosine':
         S = 1 - dists
@@ -109,6 +114,9 @@ def similarity(X, metric):
     else:
         raise ValueError(f'unknown metric: {metric}')
 
+    S = S + rewards * reward_ratio
+    S = S + rewards.T * reward_ratio
+    
     return S
 
 
@@ -132,8 +140,8 @@ def get_facility_location_order(S, B, weights=None):
     return order, sz
 
 
-def coreset_order(X, metric, B, weights=None):
-    S = similarity(X, metric=metric)
+def coreset_order(X, metric, B, rewards, weights=None):
+    S = similarity(X, metric=metric, rewards=rewards)
     order, cluster_sz = get_facility_location_order(S, B, weights)
     return order, cluster_sz
 
@@ -142,13 +150,13 @@ def test_coreset_order():
     start = time.time()
     seed = 321
     np.random.seed(seed)
-    n = 10000
+    n = 5000
     d = 20
     b = 10
     print(f"settings: n = {n}, d = {d}, b = {b}")
     X = np.random.rand(n, d)
     Y = np.random.rand(n, 3, 4)
-    print(f'first 5 Y: {Y[:5]}')
+    # print(f'first 5 Y: {Y[:5]}')
     order, cluster_sz = coreset_order(X, 'euclidean', b)
     t = time.time() - start
     print(f"time consumed: {t}")
@@ -156,7 +164,7 @@ def test_coreset_order():
     print(cluster_sz)
     select_Y = Y[order]
     Y[:b] = select_Y
-    print(f"after select, first 5 Y: {Y[:5]}")
+    # print(f"after select, first 5 Y: {Y[:5]}")
 
 
 if __name__ == '__main__':

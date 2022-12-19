@@ -35,6 +35,8 @@ class BaseAlgorithm(metaclass=abc.ABCMeta):
         min_steps_before_training=5000,
         replay_buffer=None,
         replay_buffer_size=10000,
+        craig_flag=False,
+        coreset_size=5000,
         freq_saving=1,
         save_replay_buffer=False,
         # save_environment=False,
@@ -63,7 +65,7 @@ class BaseAlgorithm(metaclass=abc.ABCMeta):
         self.exploration_policy = exploration_policy
         if inference_reward_num != None:
             self.inference_reward_num = inference_reward_num
-            self.reward_list_one_iter = []
+        self.reward_list_one_iter = []
 
         self.num_epochs = num_epochs + 1 # make the last epoch `num_epochs`
         self.num_env_steps_per_epoch = num_steps_per_epoch
@@ -117,10 +119,13 @@ class BaseAlgorithm(metaclass=abc.ABCMeta):
         self.action_space = env.action_space
         self.obs_space = env.observation_space
         self.replay_buffer_size = replay_buffer_size
+        self.craig_flag = craig_flag
+        self.coreset_size = coreset_size
         if replay_buffer is None:
             assert max_path_length < replay_buffer_size
             replay_buffer = EnvReplayBuffer(
-                self.replay_buffer_size, self.env, random_seed=np.random.randint(10000)
+                self.replay_buffer_size, self.env, random_seed=np.random.randint(10000),
+                craig_flag=self.craig_flag, coreset_size=self.coreset_size
             )
         else:
             assert max_path_length < replay_buffer._max_replay_buffer_size

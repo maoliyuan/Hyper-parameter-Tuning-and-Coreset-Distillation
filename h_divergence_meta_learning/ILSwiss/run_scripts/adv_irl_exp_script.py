@@ -76,7 +76,7 @@ def experiment(variant):
     expert_replay_buffer = EnvReplayBuffer(
         variant["adv_irl_params"]["replay_buffer_size"],
         env,
-        random_seed=np.random.randint(10000),
+        random_seed=np.random.randint(10000)
     )
 
     tmp_env_wrapper = env_wrapper = ProxyEnv  # Identical wrapper
