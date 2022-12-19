@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import random
 import os
-import TorchOpt
+import torchopt as TorchOpt
 from torch.distributions import Categorical
 from torch.distributions.kl import kl_divergence
 import matplotlib.pyplot as plt
@@ -40,7 +40,7 @@ class ActorCritic(nn.Module):
 
         probs = T.softmax(pi, dim=1)
         dist = Categorical(probs)
-
+        
         return dist, v
 
     def choose_action(self, observation):
@@ -112,13 +112,12 @@ class Agent:
     def rollout(self, bootstrap=False):
         log_probs, values, rewards, masks, states = [], [], [], [], []
         rollout_reward, entropy = 0, 0
+        abs_rollout_reward = 0
         obs = self.env.reset()
         done = False
         for _ in range(self.rollout_steps):
-    
             obs = T.tensor([obs], dtype=T.float).to(self.actorcritic.device)
             dist, v = self.actorcritic(obs)
-
             action = dist.sample()
             
             obs_, reward, done, _ = self.env.step(action.cpu().numpy()[0])
@@ -135,6 +134,7 @@ class Agent:
             #masks.append(T.tensor([1-int(done)], dtype=T.float).to(self.actorcritic.device))
             #rollout_reward += reward*(1-int(done))
             rollout_reward += reward
+            abs_rollout_reward += abs(reward)
             self.accum_reward += reward
             self.cum_reward.append(self.accum_reward)
             
@@ -247,6 +247,7 @@ class Agent:
                 print(f"CR and ER, step# {ct}:")
                 print(self.cum_reward[-1])
                 print(self.entropy_rate[-1])
+                print("avg reward:", self.avg_reward[-1])
                 print("###")
 
     def save_models(self):
