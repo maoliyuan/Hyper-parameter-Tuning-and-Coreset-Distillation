@@ -61,6 +61,7 @@ class BaseAlgorithm(metaclass=abc.ABCMeta):
             pass
         self.training_env = training_env
         self.exploration_policy = exploration_policy
+        self.reward_list_one_iter = None
         if inference_reward_num != None:
             self.inference_reward_num = inference_reward_num
             self.reward_list_one_iter = []
@@ -203,7 +204,8 @@ class BaseAlgorithm(metaclass=abc.ABCMeta):
 
                 rewards = raw_rewards
                 total_rews += raw_rewards
-                self.reward_list_one_iter.append(raw_rewards)
+                if self.reward_list_one_iter != None:
+                    self.reward_list_one_iter.append(raw_rewards)
 
                 self._handle_vec_step(
                     observations,

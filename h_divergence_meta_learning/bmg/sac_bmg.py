@@ -8,6 +8,7 @@ import os
 import copy
 import torchopt as TorchOpt
 import torchopt
+import math
 from torch.distributions import Categorical
 from torch.distributions.kl import kl_divergence
 import matplotlib.pyplot as plt
@@ -128,8 +129,8 @@ class MetaMLP(nn.Module):
         self.load_state_dict(T.load(self.chkpt_file))
 
 class Agent:
-    def __init__(self, input_dims, n_actions, gamma, prior, lr, m_lr, alpha, betas, eps, name, 
-                    env, steps, K_steps, L_steps, rollout_steps_per_call, buffer_size, min_size_before_training, train_batch_size, discount, meta_start_epoch, cuda_device_num, random_seed):
+    def __init__(self, env_threshold, input_dims, n_actions, gamma, prior, lr, m_lr, alpha, betas, eps, name, 
+                    env, steps, K_steps, L_steps, rollout_steps_per_call, buffer_size, min_size_before_training, train_batch_size, discount, meta_start_epoch, cuda_device_num, random_seed, plot_num):
         super(Agent, self).__init__()
         self.device = T.device('cuda:'+str(cuda_device_num) if T.cuda.is_available() else 'cpu')
 
@@ -138,11 +139,12 @@ class Agent:
         # self.vf = Value(input_dims, lr, fc1_dims = 256, fc2_dims = 256, cuda_device_num = cuda_device_num)
         self.qf1 = Qfunc(input_dims, n_actions, lr, fc1_dims = 256, fc2_dims = 256, cuda_device_num = cuda_device_num).to(self.device)
         self.qf2 = Qfunc(input_dims, n_actions, lr, fc1_dims = 256, fc2_dims = 256, cuda_device_num = cuda_device_num).to(self.device)
-        self.meta_mlp = MetaMLP(prior, m_lr, betas, eps, input_dims=10, fc1_dims=32, cuda_device_num = cuda_device_num)
+        self.meta_mlp = MetaMLP(prior, m_lr, betas, eps, input_dims=20, fc1_dims=32, cuda_device_num = cuda_device_num)
 
         self.qf1_optim = TorchOpt.MetaAdam(self.qf1,lr=lr, use_accelerated_op=True, moment_requires_grad=False)
         self.qf2_optim = TorchOpt.MetaAdam(self.qf2,lr=lr, use_accelerated_op=True, moment_requires_grad=False)
 
+        self.env_threshold = env_threshold
         self.obs_replay_buffer = np.zeros((buffer_size, input_dims))
         self.next_obs_replay_buffer = np.zeros((buffer_size, input_dims))
         self.action_replay_buffer = np.zeros((buffer_size, 1))
@@ -150,6 +152,7 @@ class Agent:
         self.min_size_before_training = min_size_before_training
         self.train_batch_size = train_batch_size
         self.effect_num = 0
+        self.plot_num = plot_num
         self.meta_start_epoch = meta_start_epoch
         self.matching_loss = torch.nn.KLDivLoss(reduction='batchmean')
         
@@ -169,17 +172,23 @@ class Agent:
         
         #stats
         self.avg_reward = [0 for _ in range(10)]
+        self.avg_entropy = [-math.log(n_actions) for _ in range(10)]
         self.accum_reward = 0
         self.cum_reward = []
         self.epoch_reward = []
+        self.epoch_entropy = []
         self.entropy_rate = []
+        self.avg_reward_plot = []
+        self.alpha_plot = []
 
     def rollout(self):
         obs = torch.tensor(self.env.reset()).to(self.device, torch.float)
         rollout_reward = 0
+        min_entropy = 10
         bootstrap_states = np.zeros((self.rollout_steps_per_call, self.input_dims))
         for idx in range(self.rollout_steps_per_call):
-            action, _ = self.policy.choose_action(obs)
+            action_dist = Categorical(self.policy(obs))
+            action = action_dist.sample()
             obs = obs.cpu().numpy()
             action = action.cpu().numpy()
             obs_, reward, done, _ = self.env.step(action)
@@ -191,22 +200,33 @@ class Agent:
             
             self.epoch_reward.append(reward)
             rollout_reward += reward
+            action_entropy = action_dist.entropy().item()
+            self.epoch_entropy.append(action_entropy)
+            min_entropy = min(action_entropy, min_entropy)
             self.accum_reward += reward
             self.cum_reward.append(self.accum_reward)
 
             obs = torch.tensor(obs_).to(self.device, torch.float)
             self.effect_num += 1
+            if self.effect_num == self.env_threshold:
+                self.effect_num = 0
+                while self.effect_num <= self.min_size_before_training:
+                    self.rollout()
             # No need, since non-episodic
             '''
             if done:
                 break
             '''
-        self.avg_reward = self.avg_reward[1:] 
+        self.avg_reward = self.avg_reward[1: ] 
         self.avg_reward.append(rollout_reward / self.rollout_steps_per_call)
+        self.avg_reward_plot.append(rollout_reward / self.rollout_steps_per_call)
+        self.avg_entropy = self.avg_entropy[1: ]
+        self.avg_entropy.append(min_entropy)
         # print(np.sum(np.abs(rollout_reward)) / self.rollout_steps_per_call)
-        ar = T.tensor(np.array(self.avg_reward)).to(self.policy.device, dtype=T.float)
+        ar = T.tensor(np.array(self.avg_reward + self.avg_entropy)).to(self.policy.device, dtype=T.float)
         alpha = self.meta_mlp(ar)
         self.entropy_rate.append(alpha.item()) 
+        self.alpha_plot.append(alpha.item())
         return alpha, bootstrap_states
 
     def train_step(self, epoch, meta_alpha, bootstrap=False):
@@ -334,37 +354,53 @@ class Agent:
                 print(self.cum_reward[-1])
                 print(self.entropy_rate[-1])
                 print("reward mean:", np.mean(np.array(self.epoch_reward)))
-                print("reward_max:", np.max(np.array(self.epoch_reward)))
-                print("reward_min:", np.min(np.array(self.epoch_reward)))
+                print("reward max:", np.max(np.array(self.epoch_reward)))
+                print("reward min:", np.min(np.array(self.epoch_reward)))
                 self.epoch_reward.clear()
+                print("entropy mean:", np.mean(np.array(self.epoch_entropy)))
+                print("entropy max:", np.max(np.array(self.epoch_entropy)))
+                print("entropy min:", np.min(np.array(self.epoch_entropy)))
+                self.epoch_entropy.clear()
                 print("policy loss:", policy_loss)
                 print("q1 mean", q1_mean)
                 print("q2 mean", q2_mean)
                 print("###")
+            if len(self.avg_reward_plot) == self.plot_num:
+                return self.avg_reward_plot, self.alpha_plot
+
+def smoothing_curve(array):
+    length = int(len(array) / 10)
+    new_list = []
+    idx = 0
+    while(idx < len(array)):
+        new_list.append(sum(array[idx: min(idx+length, len(array))]) / (min(idx+length, len(array)) - idx))
+        idx += length
+    return new_list
 
 if __name__ == "__main__":
     '''Driver code'''
-    steps = 4_800_000
+    steps = 165_000
+    plot_num = 5000
     K_steps = 5
     L_steps = 5
-    rollout_steps_per_call = 50
+    rollout_steps_per_call = 16
     train_batchsize = 256
     buffer_size = 4800000
     min_size_before_training = 1000
     discount = 0.99
-    meta_start_epoch = 0
     random_seed = 5
     env = TwoColorGridWorld()
+    env_threshold = 1000000000
     n_actions = 4
     input_dims = env.observation_space.shape[0]
     gamma = 0.99
     lr = 1e-4
     m_lr = 1e-4
-    alpha = 0.05
+    alphas = [0.4, 0.3, 0.2, 0.1, 0.05, 0.01, 1, 10]
     prior = 0
     betas = (0.9, 0.999)
     eps = 1e-4
-    cuda_device_num = 4
+    cuda_device_num = 3
     name = 'meta_agent_bmg' 
 
     # set seed
@@ -372,10 +408,38 @@ if __name__ == "__main__":
     T.manual_seed(random_seed)
     np.random.seed(random_seed)
     random.seed(random_seed)
-
-    agent = Agent(input_dims, n_actions, gamma, prior, lr, m_lr, alpha, betas, eps, name, env, 
+    avg_reward_diff_alpha = []
+    agent = Agent(env_threshold, input_dims, n_actions, gamma, prior, lr, m_lr, 0, betas, eps, name, env, 
                     steps, K_steps, L_steps, rollout_steps_per_call, buffer_size, min_size_before_training, 
-                    train_batchsize, discount, meta_start_epoch, cuda_device_num, random_seed)
-    agent.run()
+                    train_batchsize, discount, 0, cuda_device_num, random_seed, plot_num)
+    meta_avg_reward, meta_alpha = agent.run()
+    avg_reward_diff_alpha.append(meta_avg_reward)
+    for alpha in alphas:
+        agent = Agent(env_threshold, input_dims, n_actions, gamma, prior, lr, m_lr, alpha, betas, eps, name, env, 
+                    steps, K_steps, L_steps, rollout_steps_per_call, buffer_size, min_size_before_training, 
+                    train_batchsize, discount, 10000000, cuda_device_num, random_seed, plot_num)
+        avg_reward, _ = agent.run()
+        avg_reward_diff_alpha.append(avg_reward)
+
     print("done")
-    agent.plot_results()
+    ma = plt.figure(figsize=(10, 10)) 
+    plt.plot(meta_alpha)
+    plt.xlabel('Env rollout times')
+    plt.ylabel('Meta Alpha Value')
+    plt.savefig('meta_alpha.jpg')
+    plt.close(ma)
+
+    fig, ax= plt.subplots()
+    l1, = ax.plot(smoothing_curve(avg_reward_diff_alpha[0]), label='meta_alpha')
+    l2, = ax.plot(smoothing_curve(avg_reward_diff_alpha[1]), label='alpha=0.4')
+    l3, = ax.plot(smoothing_curve(avg_reward_diff_alpha[2]), label='alpha=0.3')
+    l4, = ax.plot(smoothing_curve(avg_reward_diff_alpha[3]), label='alpha=0.2')
+    l5, = ax.plot(smoothing_curve(avg_reward_diff_alpha[4]), label='alpha=0.1')
+    l6, = ax.plot(smoothing_curve(avg_reward_diff_alpha[5]), label='alpha=0.05')
+    l7, = ax.plot(smoothing_curve(avg_reward_diff_alpha[6]), label='alpha=0.01')
+    l8, = ax.plot(smoothing_curve(avg_reward_diff_alpha[7]), label='alpha=1')
+    l9, = ax.plot(smoothing_curve(avg_reward_diff_alpha[8]), label='alpha=10')
+    ax.legend([l1, l2, l3, l4, l5, l6, l7, l8, l9], ["meta_alpha", "alpha=0.4", "alpha=0.3", "alpha=0.2", "alpha=0.1", "alpha=0.05", "alpha=0.01", "alpha=1", "alpha=10"], loc='lower right')
+    plt.xlabel('Env rollout times')
+    plt.ylabel('Average Reward')
+    plt.savefig('avg_reward.jpg')

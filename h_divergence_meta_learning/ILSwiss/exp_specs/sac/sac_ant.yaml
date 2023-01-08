@@ -37,6 +37,7 @@ constants:
 
   sac_params:
     alpha: 0.2
+    train_alpha: False
     reward_scale: 1.0
     discount: 0.99
     soft_target_tau: 0.005

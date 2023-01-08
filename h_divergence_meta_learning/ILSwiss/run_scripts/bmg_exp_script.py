@@ -65,6 +65,7 @@ def experiment(variant):
     matching_loss = variant["matching_loss"]
     matching_mean_coef = variant["matching_mean_coef"]
     matching_std_coef = variant["matching_std_coef"]
+    meta_start_epoch = variant["meta_start_epoch"]
     qf1 = FlattenMlp(
         hidden_sizes=num_hidden * [net_size],
         input_size=obs_dim + action_dim,
@@ -82,7 +83,7 @@ def experiment(variant):
     )
     meta_mlp = Mlp(
         hidden_sizes=num_hidden * [meta_net_size],
-        input_size=inference_reward_num + 1,
+        input_size=inference_reward_num,
         output_size=1,
     )
     policy = ReparamTanhMultivariateGaussianPolicy(
@@ -98,7 +99,8 @@ def experiment(variant):
     trainer = BootstrappedMetaGradient(
         device=ptu.device, policy=policy, policy_k=policy_k, meta_mlp=meta_mlp,
         qf1=qf1, qf2=qf2, vf=vf, inner_loop_steps=inner_loop_steps, bootstrap_loop_steps=bootstrap_loop_steps, 
-        matching_mean_coef=matching_mean_coef, matching_std_coef=matching_std_coef, matching_loss=matching_loss, **variant["sac_params"]
+        matching_mean_coef=matching_mean_coef, matching_std_coef=matching_std_coef, matching_loss=matching_loss,
+        meta_start_epoch=meta_start_epoch, **variant["sac_params"]
     )
     algorithm = TorchMetaRLAlgorithm(
         trainer=trainer,
@@ -118,18 +120,31 @@ def experiment(variant):
 
     if ptu.gpu_enabled():
         algorithm.to(ptu.device)
-    # meta_optimizer_class = torchopt.MetaAdam
-    # algorithm.policy_optimizer = meta_optimizer_class(
-    #     policy, lr=0.0001
+    meta_optimizer_class = torchopt.MetaAdam
+    algorithm.trainer.policy_optimizer = meta_optimizer_class(
+        policy, lr=3e-4, use_accelerated_op=True,
+    )
+    algorithm.trainer.qf1_optimizer = meta_optimizer_class(
+        qf1, lr=3e-4, use_accelerated_op=True,
+    )
+    algorithm.trainer.qf2_optimizer = meta_optimizer_class(
+        qf2, lr=3e-4, use_accelerated_op=True,
+    )
+    algorithm.trainer.vf_optimizer = meta_optimizer_class(
+        vf, lr=3e-4, use_accelerated_op=True,
+    )
+    # meta_optimizer_class = torch.optim.Adam
+    # algorithm.trainer.policy_optimizer = meta_optimizer_class(
+    #     policy.parameters(), lr=0.0003, 
     # )
-    # algorithm.qf1_optimizer = meta_optimizer_class(
-    #     qf1, lr=0.0001
+    # algorithm.trainer.qf1_optimizer = meta_optimizer_class(
+    #     qf1.parameters(), lr=0.0003, 
     # )
-    # algorithm.qf2_optimizer = meta_optimizer_class(
-    #     qf2, lr=0.0001
+    # algorithm.trainer.qf2_optimizer = meta_optimizer_class(
+    #     qf2.parameters(), lr=0.0003, 
     # )
-    # algorithm.vf_optimizer = meta_optimizer_class(
-    #     vf, lr=0.0001
+    # algorithm.trainer.vf_optimizer = meta_optimizer_class(
+    #     vf.parameters(), lr=0.0003, 
     # )
     algorithm.train(start_epoch=epoch)
 

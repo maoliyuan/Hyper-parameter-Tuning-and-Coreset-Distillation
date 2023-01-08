@@ -10,7 +10,7 @@ class TwoColorGridWorld(gym.Env):
         self.action_space = Discrete(4)
         self.random_squares = random.sample(range(self.size), 3)  # g,b,r == 0,1,2
         self.rewards = [-0.04, 1, -1] # g,b,r
-        self.threshold = 100_000
+        self.threshold = 100000000_000
         self.step_count = 0
 
         self.observation_space = self.make_space()

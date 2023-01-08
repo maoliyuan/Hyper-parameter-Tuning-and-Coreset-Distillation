@@ -19,6 +19,7 @@ constants:
   matching_loss: "mse"
   matching_mean_coef: 1.0
   matching_std_coef: 1.0
+  meta_start_epoch: 20
 
   rl_alg_params:
     num_epochs: 200

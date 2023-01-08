@@ -17,6 +17,7 @@ class TorchMetaRLAlgorithm(TorchBaseAlgorithm):
         self.inner_loop_steps = inner_loop_steps
         self.bootstrap_loop_steps = bootstrap_loop_steps
         self.device = device
+        self.avg_reward_per_iter = [0 for _ in range(self.inference_reward_num)]
 
     def get_batch(self):
         batch = self.replay_buffer.random_batch(self.batch_size)
@@ -31,22 +32,17 @@ class TorchMetaRLAlgorithm(TorchBaseAlgorithm):
             net.train(mode)
 
     def _do_training(self, epoch):
-        all_reward_per_iter = np.sort(np.concatenate(self.reward_list_one_iter, axis=0))
-        avg_reward_per_iter = torch.zeros(self.inference_reward_num + 1).to(self.device)
-        interval = int(len(all_reward_per_iter) / self.inference_reward_num)
-        for i in range(self.inference_reward_num):
-            if i == self.inference_reward_num - 1:
-                avg_reward_per_iter[i] = np.mean(all_reward_per_iter[i*interval: ])
-            else:
-                avg_reward_per_iter[i] = np.mean(all_reward_per_iter[i*interval: (i+1)*interval])
+        self.avg_reward_per_iter = self.avg_reward_per_iter[1:] 
+        self.avg_reward_per_iter.append(np.mean(np.concatenate(self.reward_list_one_iter, axis=0)))
+        avg_reward_per_iter = torch.tensor(self.avg_reward_per_iter).to(self.device, dtype=torch.float)
         for step in range(self.num_train_steps_per_train_call):
             self.inner_train_steps_total = step + self._n_train_steps_total*self.num_train_steps_per_train_call
             # avg_reward_per_iter[-1] = step / self.num_train_steps_per_train_call #normalization for step, don't modify it when training!
             if getattr(self.trainer, "on_policy", False):
-                self.trainer.train_step(self.get_all_trajs(), self.inner_train_steps_total, avg_reward_per_iter)
+                self.trainer.train_step(self.get_all_trajs(), self.inner_train_steps_total, avg_reward_per_iter, epoch)
                 self.clear_buffer()
             else:
-                self.trainer.train_step(self.get_batch(), self.inner_train_steps_total, avg_reward_per_iter)
+                self.trainer.train_step(self.get_batch(), self.inner_train_steps_total, avg_reward_per_iter, epoch)
         self.reward_list_one_iter.clear()
 
     def get_epoch_snapshot(self, epoch):

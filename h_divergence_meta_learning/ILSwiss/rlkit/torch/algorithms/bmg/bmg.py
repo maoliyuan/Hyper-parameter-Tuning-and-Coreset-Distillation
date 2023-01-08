@@ -3,6 +3,7 @@ from collections import OrderedDict
 import numpy as np
 import torch
 from torch import nn as nn
+from torch.nn.functional import relu
 import torch.optim as optim
 import torchopt as TorchOpt
 import copy
@@ -37,18 +38,20 @@ class BootstrappedMetaGradient(Trainer):
         policy_lr=1e-3,
         qf_lr=1e-3,
         vf_lr=1e-3,
-        meta_mlp_lr=1e-4,
+        meta_mlp_lr=3e-4,
         soft_target_tau=1e-2,
         policy_mean_reg_weight=1e-3,
         policy_std_reg_weight=1e-3,
         inner_loop_steps=1, 
         bootstrap_loop_steps=1,
+        meta_start_epoch=20,
         optimizer_class=optim.Adam,
-        meta_optimizer_class=TorchOpt.MetaSGD,
+        meta_optimizer_class=TorchOpt.MetaAdam,
         matching_loss="mse",
         matching_mean_coef=1,
         matching_std_coef=1,
         beta_1=0.9,
+        alpha=1.0,
         **kwargs,
     ):
         self.device=device
@@ -70,29 +73,31 @@ class BootstrappedMetaGradient(Trainer):
         self.k_l_m1_state_dict = None
         self.matching_mean_coef = matching_mean_coef
         self.matching_std_coef = matching_std_coef
+        self.meta_start_epoch = meta_start_epoch
+        self.entropy_coefficients = []
         if matching_loss == "mse":
             self.matching_loss = nn.MSELoss()
 
         self.target_vf = vf.copy()
         self.eval_statistics = None
 
-        self.policy_optimizer = meta_optimizer_class(
-            self.policy, lr=policy_lr
-        )
-        self.qf1_optimizer = meta_optimizer_class(
-            self.qf1, lr=qf_lr
-        )
-        self.qf2_optimizer = meta_optimizer_class(
-            self.qf2, lr=qf_lr
-        )
-        self.vf_optimizer = meta_optimizer_class(
-            self.vf, lr=vf_lr
-        )
+        # self.policy_optimizer = meta_optimizer_class(
+        #     self.policy, lr=policy_lr
+        # )
+        # self.qf1_optimizer = meta_optimizer_class(
+        #     self.qf1, lr=qf_lr
+        # )
+        # self.qf2_optimizer = meta_optimizer_class(
+        #     self.qf2, lr=qf_lr
+        # )
+        # self.vf_optimizer = meta_optimizer_class(
+        #     self.vf, lr=vf_lr
+        # )
         self.meta_mlp_optimizer = optimizer_class(
             self.meta_mlp.parameters(), lr=meta_mlp_lr, betas=(beta_1, 0.999)
         )
         
-    def train_step(self, batch, n_train_step_total, avg_reward_per_iter):
+    def train_step(self, batch, n_train_step_total, avg_reward_per_iter, epoch):
         # q_params = itertools.chain(self.qf1.parameters(), self.qf2.parameters())
         # v_params = itertools.chain(self.vf.parameters())
         # policy_params = itertools.chain(self.policy.parameters())
@@ -103,6 +108,8 @@ class BootstrappedMetaGradient(Trainer):
         actions = batch["actions"]
         next_obs = batch["next_observations"]
         policy_outputs = self.policy(obs, return_log_prob=True)
+        meta_alpha = self.meta_mlp(avg_reward_per_iter)
+        self.entropy_coefficients.append(meta_alpha)
         """
         QF Loss
         """
@@ -146,7 +153,10 @@ class BootstrappedMetaGradient(Trainer):
             q1_new_acts = self.qf1(obs, new_actions)
             q2_new_acts = self.qf2(obs, new_actions)  ## error
             q_new_actions = torch.min(q1_new_acts, q2_new_acts)
-            v_target = q_new_actions - self.meta_mlp(avg_reward_per_iter) * log_pi
+            if epoch >= self.meta_start_epoch:
+                v_target = q_new_actions - relu(self.meta_mlp(avg_reward_per_iter)) * log_pi
+            else:
+                v_target = q_new_actions - 0.2 * log_pi
             v_target = v_target.detach()
             vf_loss = 0.5 * torch.mean((v_pred - v_target) ** 2)
 
@@ -183,14 +193,14 @@ class BootstrappedMetaGradient(Trainer):
         qf1_copy = copy.deepcopy(self.qf1).to(self.device)
         qf2_copy = copy.deepcopy(self.qf2).to(self.device)
         new_actions, policy_mean, policy_log_std, log_pi = policy_outputs[:4]
-        q1_new_acts = qf1_copy(torch.cat((obs, actions), dim=1))
-        q2_new_acts = qf2_copy(torch.cat((obs, actions), dim=1))  ## error
+        q1_new_acts = qf1_copy(torch.cat((obs, new_actions), dim=1))
+        q2_new_acts = qf2_copy(torch.cat((obs, new_actions), dim=1))  ## error
         q_new_actions = torch.min(q1_new_acts, q2_new_acts)
 
-        if n_train_step_total % self.num_steps_per_loop != self.num_steps_per_loop-1:
-            policy_loss = torch.mean(self.meta_mlp(avg_reward_per_iter) * log_pi - q_new_actions)
+        if n_train_step_total % self.num_steps_per_loop != self.num_steps_per_loop-1 and epoch >= self.meta_start_epoch:
+            policy_loss = torch.mean(relu(self.meta_mlp(avg_reward_per_iter)) * log_pi - q_new_actions)
         else:
-            policy_loss = torch.mean(-1 * q_new_actions)  ##
+            policy_loss = torch.mean(0.2 * log_pi - q_new_actions)  ##
         mean_reg_loss = self.policy_mean_reg_weight * (policy_mean**2).mean()
         std_reg_loss = self.policy_std_reg_weight * (policy_log_std**2).mean()
         policy_reg_loss = mean_reg_loss + std_reg_loss
@@ -203,13 +213,16 @@ class BootstrappedMetaGradient(Trainer):
         if n_train_step_total % self.num_steps_per_loop == self.num_steps_per_loop-2:
             assert self.k_l_m1_state_dict == None
             self.k_l_m1_state_dict = TorchOpt.extract_state_dict(self.policy)
+            self.k_l_m1_optimizer_dict = TorchOpt.extract_state_dict(self.policy_optimizer)
         if n_train_step_total % self.num_steps_per_loop == self.num_steps_per_loop-1:
-            matching_loss = self.matching_function(self.policy_k, self.policy, obs, self.k_state_dict)
-            self.meta_mlp_optimizer.zero_grad()
-            with torch.autograd.set_detect_anomaly(True):
-                matching_loss.backward()
-            self.meta_mlp_optimizer.step()
+            if epoch >= self.meta_start_epoch:
+                matching_loss = self.matching_function(self.policy_k, self.policy, obs, self.k_state_dict)
+                self.meta_mlp_optimizer.zero_grad()
+                with torch.autograd.set_detect_anomaly(True):
+                    matching_loss.backward()
+                self.meta_mlp_optimizer.step()
             TorchOpt.recover_state_dict(self.policy, self.k_l_m1_state_dict)
+            TorchOpt.recover_state_dict(self.policy_optimizer, self.k_l_m1_optimizer_dict)
             TorchOpt.stop_gradient(self.policy)
             TorchOpt.stop_gradient(self.policy_optimizer)
             TorchOpt.stop_gradient(self.qf1)
@@ -270,6 +283,13 @@ class BootstrappedMetaGradient(Trainer):
                     ptu.get_numpy(policy_log_std),
                 )
             )
+            self.eval_statistics.update(
+                create_stats_ordered_dict(
+                    "Entropy coefficient",
+                    ptu.get_numpy(torch.cat(self.entropy_coefficients)),
+                )
+            )
+            self.entropy_coefficients.clear()
 
     @property
     def networks(self):
