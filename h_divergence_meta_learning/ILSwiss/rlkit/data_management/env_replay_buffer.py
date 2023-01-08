@@ -5,7 +5,7 @@ from gym.spaces import Box, Discrete, Tuple, Dict
 
 
 class EnvReplayBuffer(SimpleReplayBuffer):
-    def __init__(self, max_replay_buffer_size, env, random_seed=1995):
+    def __init__(self, max_replay_buffer_size, env, random_seed=1995, craig_flag=False, coreset_size=50000):
         """
         :param max_replay_buffer_size:
         :param env:
@@ -17,6 +17,8 @@ class EnvReplayBuffer(SimpleReplayBuffer):
             observation_dim=get_dim(self._ob_space),
             action_dim=get_dim(self._action_space),
             random_seed=random_seed,
+            craig_flag=craig_flag,
+            coreset_size=coreset_size
         )
 
     def add_sample(

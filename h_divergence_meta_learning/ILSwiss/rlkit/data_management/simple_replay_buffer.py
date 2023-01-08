@@ -2,6 +2,7 @@ from itertools import starmap
 import numpy as np
 import pickle
 from rlkit.data_management.replay_buffer import ReplayBuffer
+import rlkit.data_management.craig as craig
 
 
 class SimpleReplayBuffer(ReplayBuffer):
@@ -15,13 +16,16 @@ class SimpleReplayBuffer(ReplayBuffer):
     """
 
     def __init__(
-        self, max_replay_buffer_size, observation_dim, action_dim, random_seed=1995
+        self, max_replay_buffer_size, observation_dim, action_dim, craig_flag, coreset_size, random_seed=1995
     ):
         self._np_rand_state = np.random.RandomState(random_seed)
 
         self._observation_dim = observation_dim
         self._action_dim = action_dim
         self._max_replay_buffer_size = max_replay_buffer_size
+        self.craig_flag = craig_flag
+        self.coreset_size = coreset_size
+        self.coreset_threshold = 100000
 
         obs_dtype = np.uint8 if type(observation_dim) == tuple else np.float64
 
@@ -85,6 +89,14 @@ class SimpleReplayBuffer(ReplayBuffer):
         timeout=False,
         **kwargs
     ):
+        # if self.craig_flag and self._top + 1 >= self.coreset_threshold:
+        #     # craig
+        #     self.compress_coreset(self.coreset_size)
+        if self.craig_flag and ((self._top - self.coreset_threshold) 
+                                % (self.coreset_threshold + self.coreset_size)
+                                == 0):
+            self.compress_coreset_no_delete(self.coreset_size)
+        
         self._actions[self._top] = action
         self._rewards[self._top] = reward
         self._terminals[self._top] = terminal
@@ -240,7 +252,38 @@ class SimpleReplayBuffer(ReplayBuffer):
         self, batch_size, keys=None, multi_step=False, step_num=1, **kwargs
     ):
         indices = self._np_randint(0, self._size, batch_size)
+        
+        # unit_size = min(5000, self._size)
+        # unit_select = int(unit_size * (batch_size / self._size))
+        # unit_round = (self._size + unit_size - 1) // unit_size
+        
+        # indices = np.array([])
+        # for round in range(unit_round):
+        #     min_idx = unit_size * round
+        #     max_idx = min(unit_size * (round + 1), self._size)
+        #     X = np.concatenate((self._actions[min_idx : max_idx].repeat(20, axis=1), self._rewards[min_idx : max_idx].repeat(20, axis=1)), axis=1)
+        #     if isinstance(self._observation_dim, tuple):
+        #         obs = self._observations.reshape(self._max_replay_buffer_size[min_idx : max_idx], -1)
+        #         next_obs = self._next_obs.reshape(self._max_replay_buffer_size[min_idx : max_idx], -1)
+        #         X = np.concatenate((X, obs, next_obs), axis=1)
+        #     elif isinstance(self._observation_dim, dict):
+        #         obs_list = []
+        #         for key, dims in self._observation_dim.items():
+        #             obs_list.append(self._observations[key].reshape(self._max_replay_buffer_size[min_idx : max_idx], -1))
+        #             obs_list.append(self._next_obs[key].reshape(self._max_replay_buffer_size[min_idx : max_idx], -1))
+        #         obs_list = np.concatenate(obs_list, axis=1)
+        #         X = np.concatenate((X, obs_list), axis=1)
+        #     else:
+        #         X = np.concatenate((X, self._observations[min_idx : max_idx], self._next_obs[min_idx : max_idx]), axis=1)
+                
+                
+        #     selected_order, _ = craig.coreset_order(X, 'euclidean', unit_select, self._rewards[min_idx : max_idx].copy())
+        #     indices = np.append(indices, selected_order)
+        # indices = indices.astype('int64')
+        
+        
         if multi_step:
+            print('multi-step random batch still use random')
             indices = self._np_randint(0, self._size - step_num, batch_size)
             # candidates = list(range(0, self._size))
             # for value in list(self._traj_endpoints.values()):
@@ -440,6 +483,154 @@ class SimpleReplayBuffer(ReplayBuffer):
         # assumption is trajectory lengths are AT MOST the length of the entire replay buffer
         self._cur_start = 0
         self._traj_endpoints = {}  # start->end means [start, end)
+        
+    def compress_coreset(self, comp_size=5000):
+        print(f"start compress. size: {self._top}")
+        
+        unit_size = 5000
+        unit_select = int(unit_size * (comp_size / self._top))
+        unit_round = (self._top + unit_size - 1) // unit_size
+        
+        order = np.array([])
+        for round in range(unit_round):
+            min_idx = unit_size * round
+            max_idx = min(unit_size * (round + 1), self._top)
+            X = np.concatenate((self._actions[min_idx : max_idx].repeat(20, axis=1), self._rewards[min_idx : max_idx].repeat(20, axis=1)), axis=1)
+            if isinstance(self._observation_dim, tuple):
+                obs = self._observations.reshape(self._max_replay_buffer_size[min_idx : max_idx], -1)
+                next_obs = self._next_obs.reshape(self._max_replay_buffer_size[min_idx : max_idx], -1)
+                X = np.concatenate((X, obs, next_obs), axis=1)
+            elif isinstance(self._observation_dim, dict):
+                obs_list = []
+                for key, dims in self._observation_dim.items():
+                    obs_list.append(self._observations[key].reshape(self._max_replay_buffer_size[min_idx : max_idx], -1))
+                    obs_list.append(self._next_obs[key].reshape(self._max_replay_buffer_size[min_idx : max_idx], -1))
+                obs_list = np.concatenate(obs_list, axis=1)
+                X = np.concatenate((X, obs_list), axis=1)
+            else:
+                X = np.concatenate((X, self._observations[min_idx : max_idx], self._next_obs[min_idx : max_idx]), axis=1)
+                
+                
+            selected_order, _ = craig.coreset_order(X, 'euclidean', unit_select, self._rewards[min_idx : max_idx].copy())
+            order = np.append(order, selected_order)
+        
+        print(f'order type/shape: {type(order)} / {order.shape}')
+        order = order.astype('int64')
+        select_actions = self._actions[order]
+        select_rewards = self._rewards[order]
+        if isinstance(self._observation_dim, dict):
+            select_observations = {}
+            select_next_obs = {}
+            for key, dims in self._observation_dim.items():
+                select_observations[key] = self._observations[key][order]
+                select_next_obs = self._next_obs[key][order]
+        else:
+            select_observations = self._observations[order]
+            select_next_obs = self._next_obs[order]
+        
+        select_terminals = self._terminals[order]
+        select_timeouts = self._timeouts[order]
+        select_absorbing = self._absorbing[order]
+        select_trajs = self._trajs
+        select_cur_start = self._cur_start
+        select_traj_endpoints = self._traj_endpoints
+        
+        
+        self.clear()
+        
+        
+        if isinstance(self._observation_dim, dict):
+            for key, dims in self._observation_dim.items():
+                self._observations[key][:comp_size] = select_observations[key]
+                self._next_obs[key][:comp_size] = select_next_obs[key]
+        else:
+            self._observations[:comp_size] = select_observations
+            self._next_obs[:comp_size] = select_next_obs
+        self._actions[:comp_size] = select_actions
+
+        self._rewards[:comp_size] = select_rewards
+        self._terminals[:comp_size] = select_terminals
+        self._timeouts[:comp_size] = select_timeouts
+        self._absorbing[:comp_size] = select_absorbing
+        self._top = comp_size
+        self._size = comp_size
+        self._trajs = select_trajs
+
+        self._cur_start = select_cur_start
+        self._traj_endpoints = select_traj_endpoints
+        
+        print(f"compress success! size: {self._top}")
+    
+    
+    def compress_coreset_no_delete(self, comp_size=5000):
+        print(f"start compress. size: {self._top}")
+        start_size = self._top - self.coreset_threshold
+        
+        unit_size = 5000
+        unit_select = int(unit_size * (comp_size / self.coreset_threshold))
+        unit_round = (self.coreset_threshold + unit_size - 1) // unit_size
+        
+        order = np.array([])
+        for round in range(unit_round):
+            min_idx = start_size + unit_size * round
+            max_idx = min(start_size + unit_size * (round + 1), self._top)
+            X = np.concatenate((self._actions[min_idx : max_idx].repeat(20, axis=1), self._rewards[min_idx : max_idx].repeat(20, axis=1)), axis=1)
+            if isinstance(self._observation_dim, tuple):
+                obs = self._observations.reshape(self._max_replay_buffer_size[min_idx : max_idx], -1)
+                next_obs = self._next_obs.reshape(self._max_replay_buffer_size[min_idx : max_idx], -1)
+                X = np.concatenate((X, obs, next_obs), axis=1)
+            elif isinstance(self._observation_dim, dict):
+                obs_list = []
+                for key, dims in self._observation_dim.items():
+                    obs_list.append(self._observations[key].reshape(self._max_replay_buffer_size[min_idx : max_idx], -1))
+                    obs_list.append(self._next_obs[key].reshape(self._max_replay_buffer_size[min_idx : max_idx], -1))
+                obs_list = np.concatenate(obs_list, axis=1)
+                X = np.concatenate((X, obs_list), axis=1)
+            else:
+                X = np.concatenate((X, self._observations[min_idx : max_idx], self._next_obs[min_idx : max_idx]), axis=1)
+                
+                
+            selected_order, _ = craig.coreset_order(X, 'euclidean', unit_select, self._rewards[min_idx : max_idx].copy())
+            order = np.append(order, selected_order)
+        
+        print(f'order type/shape: {type(order)} / {order.shape}')
+        order = order.astype('int64')
+        select_actions = self._actions[order]
+        select_rewards = self._rewards[order]
+        if isinstance(self._observation_dim, dict):
+            select_observations = {}
+            select_next_obs = {}
+            for key, dims in self._observation_dim.items():
+                select_observations[key] = self._observations[key][order]
+                select_next_obs = self._next_obs[key][order]
+        else:
+            select_observations = self._observations[order]
+            select_next_obs = self._next_obs[order]
+        
+        select_terminals = self._terminals[order]
+        select_timeouts = self._timeouts[order]
+        select_absorbing = self._absorbing[order]
+        
+        k = 1
+        for i in range(k):
+            if isinstance(self._observation_dim, dict):
+                for key, dims in self._observation_dim.items():
+                    self._observations[key][self._top : self._top + comp_size] = select_observations[key]
+                    self._next_obs[key][self._top : self._top + comp_size] = select_next_obs[key]
+            else:
+                self._observations[self._top : self._top + comp_size] = select_observations
+                self._next_obs[self._top : self._top + comp_size] = select_next_obs
+            self._actions[self._top : self._top + comp_size] = select_actions
+
+            self._rewards[self._top : self._top + comp_size] = select_rewards
+            self._terminals[self._top : self._top + comp_size] = select_terminals
+            self._timeouts[self._top : self._top + comp_size] = select_timeouts
+            self._absorbing[self._top : self._top + comp_size] = select_absorbing
+            self._top += comp_size
+            self._size += comp_size
+        
+        print(f"compress success without delete! size: {self._top}")
+        
 
 
 def concat_nested_dicts(d1, d2):
